@@ -1,0 +1,541 @@
+// <!--
+// The MIT License (MIT)
+//
+// Copyright (c) 2024 Kris Jusiak <kris@jusiak.net>
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+#if 0
+// -->
+[Overview](#Overview) / [Examples](#Examples) / [API](#API) / [FAQ](#FAQ)
+
+## PROF: C++20 Profiling library
+
+[![MIT Licence](http://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/license/mit)
+[![Version](https://img.shields.io/github/v/release/qlibs/prof)](https://github.com/qlibs/prof/releases)
+[![Build](https://img.shields.io/badge/build-green.svg)](https://godbolt.org/z/7dMKMs5x5)
+[![Try it online](https://img.shields.io/badge/try%20it-online-blue.svg)](https://godbolt.org/z/79K59oeKc)
+
+  > https://en.wikipedia.org/wiki/Profiling_(computer_programming)
+
+### Requirements
+
+- C++20 ([gcc-11+, clang-12+](https://en.cppreference.com/w/cpp/compiler_support))
+
+> #### Optional ([docker](https://github.com/qlibs/prof/blob/main/Dockerfile) setup - see [FAQ](#FAQ))
+
+- callgrind (simulation) - https://valgrind.org/docs/manual/cl-manual.html
+- llvm-xray (instrumention) - https://llvm.org/docs/XRay.html
+- linux-perf (sampling) - https://perf.wiki.kernel.org
+- gperftools (sampling) - https://github.com/gperftools/gperftools
+- intel-vtune (sampling) - https://www.intel.com/content/www/us/en/docs/vtune-profiler
+
+### Overview
+
+```cpp
+int main() {
+  static_assert(prof::profiler<prof::none>);
+  static_assert(prof::profiler<prof::callgrind>);
+  static_assert(prof::profiler<prof::xray>);
+  static_assert(prof::profiler<prof::linux_perf>);
+  static_assert(prof::profiler<prof::gperf>);
+  static_assert(prof::profiler<prof::intel_vtune>);
+
+  // example
+  {
+    prof::linux_perf profiler{"/dev/shm/perf"};
+
+    profiler.start();
+    // ...
+    profiler.stop();
+  }
+}
+```
+
+```sh
+# callgrind
+$CXX -O3 callgrind.cpp -o callgrind
+valgrind --tool=callgrind \
+         --instr-atstart=no \
+         --branch-sim=yes \
+         --dump-instr=yes \
+         --collect-jumps=yes \
+         ./callgrind
+kcachegrind callgrind.*
+```
+
+```sh
+# llvm-xray
+clang++ -O3 -fxray-instrument -fxray-instruction-threshold=1 xray.cpp -o xray
+llvm-xray account xray-log.* --top=10 --sort=sum --sortorder=dsc -instr_map=./xray
+```
+
+```sh
+# linux-perf
+$CXX -O3 -g -fno-omit-frame-pointer linux_perf.cpp -o linux_perf
+mkfifo /dev/shm/perf
+perf stat --control=fifo:/dev/shm/perf --delay=-1 ./linux_perf
+perf record --control=fifo:/dev/shm/perf --delay=-1 ./linux_perf
+```
+
+```sh
+# gperf
+$CXX -O3 -g -fno-omit-frame-pointer gperf.cpp -o gperf -lprofiler
+CPUPROFILE_FREQUENCY=1000 ./gperf
+google-pprof gperf profile.prof
+```
+
+```sh
+# intel-vtune
+VTUNE=/opt/intel/oneapi/vtune/latest
+$CXX -I $VTUNE/sdk/include -O3 vtune.cpp -o vtune -L$VTUNE/lib64 -littnotify
+$VTUNE/bin64/vtune -collect hotspots -start-paused -result-dir vtune-result -- ./vtune
+$VTUNE/bin64/vtune-gui vtune-result
+```
+
+### API
+
+```cpp
+namespace prof::inline v1_0_0 {
+template<class T>
+concept profiler = requires(T t) {
+  t.start();
+  t.stop();
+};
+
+struct none {
+  constexpr auto start() { }
+  constexpr auto stop() { }
+  constexpr auto flush() { } // optional
+};
+
+#if __has_include(<valgrind/callgrind.h>)
+class callgrind {
+ public:
+  constexpr explicit callgrind(const char* profile);
+  constexpr callgrind(callgrind&&) = default;
+  constexpr callgrind(const callgrind&) = delete;
+  constexpr ~callgrind() noexcept;
+  constexpr auto start();
+  constexpr auto stop();
+  constexpr auto flush();
+};
+#endif
+
+#if __has_include(<xray/xray_interface.h>) and \
+    __has_include(<xray/xray_log_interface.h>)
+class xray {
+ public:
+  constexpr explicit xray(const char* mode = "xray-fdr",
+                          const char* cfg = "xray_logfile_base=xray-log.%");
+  constexpr ~xray() noexcept;
+  constexpr xray(xray&&) = default;
+  constexpr xray(const xray&) = delete;
+  [[clang::xray_never_instrument]] constexpr auto start();
+  [[clang::xray_never_instrument]] constexpr auto stop();
+  constexpr auto flush();
+};
+#endif
+
+#if __has_include(<fcntl.h>) and __has_include(<unistd.h>)
+class linux_perf {
+ public:
+  constexpr explicit linux_perf(const char* control);
+  constexpr linux_perf(linux_perf&&) = default;
+  constexpr linux_perf(const linux_perf&) = delete;
+  constexpr ~linux_perf() noexcept;
+  constexpr auto start();
+  constexpr auto stop();
+};
+#endif
+
+#if __has_include(<gperftools/profiler.h>)
+class gperf {
+ public:
+  constexpr explicit gperf(const char* fname);
+  constexpr gperf(gperf&&) = default;
+  constexpr gperf(const gperf&) = delete;
+  constexpr ~gperf() noexcept;
+  constexpr auto start();
+  constexpr auto stop();
+  constexpr auto flush();
+};
+#endif
+
+#if __has_include(<ittnotify.h>)
+class intel_vtune {
+ public:
+  constexpr explicit intel_vtune(const char* domain, const char* task);
+  constexpr intel_vtune(intel_vtune&&) = default;
+  constexpr intel_vtune(const intel_vtune&) = delete;
+  constexpr ~intel_vtune() noexcept;
+  constexpr auto start();
+  constexpr auto stop();
+};
+#endif
+} // namespace prof
+```
+
+### FAQ
+
+- Setup [docker](https://www.docker.com) ([Dockerfile](https://github.com/qlibs/prof/blob/main/Dockerfile))
+
+  ```sh
+  docker build -t prof .
+  ```
+
+  ```sh
+  docker run \
+    -it \
+    --privileged \
+    --network=host \
+    -e DISPLAY=${DISPLAY} \
+    -v ${PWD}:${PWD} \
+    -w ${PWD} \
+    prof
+  ```
+
+- Setup [linux-perf](https://perf.wiki.kernel.org)
+
+  ```sh
+  sudo mount -o remount,mode=755 /sys/kernel/debug
+  sudo mount -o remount,mode=755 /sys/kernel/debug/tracing
+  sudo chown `whoami` /sys/kernel/debug/tracing/uprobe_events
+  sudo chmod a+rw /sys/kernel/debug/tracing/uprobe_events
+  echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+  echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+  echo 1000 | sudo tee /proc/sys/kernel/perf_event_max_sample_rate
+  ```
+
+- Instrumentation with [llvm-xray](https://llvm.org/docs/XRay.html)
+
+  ```cpp
+  [[clang::xray_always_instrument]]
+  void always_profile();
+
+  [[clang::xray_always_instrument, clang::xray_log_args(1)]]
+  void always_profile_and_log_i(int i);
+
+  [[clang::xray_never_instrument]]
+  void never_profile();
+  ```
+
+  ```cpp
+  # profiling threshold
+  -fxray-instruction-threshold=1 # default 200 instructions
+  ```
+
+  ```cpp
+  # instrumentation info
+  llvm-xray extract ./a.out --symbolize
+  ```
+
+  > https://godbolt.org/z/WhsEYf9cc
+
+- Conditional profiling with [callgrind](https://valgrind.org/docs/manual/cl-manual.html)
+
+  ```cpp
+  prof::callgrind profiler{"example"};
+
+  while (true) {
+    profiler.start(); // resets profile
+
+    if (should_trigger()) {
+      trigger();
+      profiler.stop();
+      proflier.flush(); // dumps `example` profile
+    }
+  }
+  ```
+
+  ```sh
+  kcachegrind callgrind.* # opens all profiles combined
+  ```
+
+- How to integrate with [CMake.FetchContent](https://cmake.org/cmake/help/latest/module/FetchContent.html)?
+
+    ```
+    include(FetchContent)
+
+    FetchContent_Declare(
+      qlibs.prof
+      GIT_REPOSITORY https://github.com/qlibs/prof
+      GIT_TAG v1.0.0
+    )
+
+    FetchContent_MakeAvailable(qlibs.prof)
+    ```
+
+    ```
+    target_link_libraries(${PROJECT_NAME} PUBLIC qlibs.prof);
+    ```
+
+- Acknowledgments
+
+  > https://valgrind.org/docs/manual/cl-manual.html
+  > https://llvm.org/docs/XRay.html
+  > https://perf.wiki.kernel.org
+  > https://github.com/gperftools/gperftools
+  > https://www.intel.com/content/www/us/en/docs/vtune-profiler
+<!--
+#endif
+
+#pragma once
+
+/**
+ * PROF: C++20 profiling library - https://github.com/qlibs/prof
+ */
+namespace prof::inline v1_0_0 {
+template<class T>
+concept profiler = requires(T t) {
+  t.start();
+  t.stop();
+};
+
+struct none {
+  constexpr auto start() { }
+  constexpr auto stop() { }
+  constexpr auto flush() { } /// optional
+};
+} // namespace prof
+
+#if __has_include(<valgrind/callgrind.h>)
+#include <valgrind/callgrind.h>
+namespace prof::inline v1_0_0 {
+/**
+ * valgrind --tool=callgrind --instr-atstart=no ./a.out
+ * kcachegrind callgrind.*
+ */
+class callgrind {
+ public:
+  constexpr explicit callgrind(const char* profile)
+    : profile_{profile}
+  { }
+
+  constexpr callgrind(callgrind&&) = default;
+  constexpr callgrind(const callgrind&) = delete;
+
+  /*constexpr*/ auto start() {
+    CALLGRIND_START_INSTRUMENTATION;
+  }
+
+  /*constexpr*/ auto stop() {
+    CALLGRIND_STOP_INSTRUMENTATION;
+  }
+
+  /*constexpr*/ auto flush() {
+    CALLGRIND_DUMP_STATS_AT(profile_);
+  }
+
+  /*constexpr*/ ~callgrind() noexcept {
+    flush();
+  }
+
+ private:
+  const char* profile_{};
+};
+} // namespace prof
+#endif
+
+#if __has_include(<xray/xray_interface.h>) and \
+    __has_include(<xray/xray_log_interface.h>)
+#include <xray/xray_interface.h>
+#include <xray/xray_log_interface.h>
+namespace prof::inline v1_0_0 {
+/**
+ * `-fxray-instrument -fxray-instruction-threshold=1`
+ * ./a.out`
+ * `llvm-xray account xray-log.* --top=10 --sort=sum --sortorder=dsc --instr_map=./a.out`
+ * https://llvm.org/docs/XRay.html
+ */
+class xray {
+ public:
+  constexpr explicit xray(const char* mode = "xray-fdr",
+                          const char* cfg = "xray_logfile_base=xray-log.%") {
+    __xray_log_select_mode(mode);
+    __xray_log_init_mode(mode, cfg);
+  }
+
+  constexpr xray(xray&&) = default;
+  constexpr xray(const xray&) = delete;
+
+  [[clang::xray_never_instrument]] /*constexpr*/ auto start() {
+    return __xray_patch();
+  }
+
+  [[clang::xray_never_instrument]] /*constexpr*/ auto stop() {
+    return __xray_unpatch();
+  }
+
+  /*constexpr*/ auto flush() {
+    __xray_log_finalize();
+    __xray_log_flushLog();
+  }
+
+  /*constexpr*/ ~xray() noexcept {
+    flush();
+  }
+};
+} // namespace prof
+#endif
+
+#if __has_include(<fcntl.h>) and __has_include(<unistd.h>)
+#include <fcntl.h>
+#include <unistd.h>
+namespace prof::inline v1_0_0 {
+/**
+ * perf record --control=fifo:/dev/shm/perf --delay=-1 ./a.out
+ */
+class linux_perf {
+  static constexpr auto enable = "enable\n";
+  static constexpr auto disable = "disable\n";
+
+ public:
+  /*constexpr*/ explicit linux_perf(const char* control)
+    : fd_{open(control, O_WRONLY)}
+  { }
+
+  constexpr linux_perf(linux_perf&& other) : fd_{static_cast<int&&>(other.fd_)} {
+    other.fd_ = -1;
+  }
+  constexpr linux_perf(const linux_perf&) = delete;
+
+  /*constexpr*/ auto start() {
+    return write(fd_, enable, sizeof(enable));
+  }
+
+  /*constexpr*/ auto stop() {
+    return write(fd_, disable, sizeof(disable));
+  }
+
+  /*constexpr*/ ~linux_perf() noexcept {
+    if (fd_ == -1) return;
+    close(fd_);
+  }
+
+ private:
+  int fd_{};
+};
+} // namespace prof
+#endif
+
+#if __has_include(<gperftools/profiler.h>)
+#include <gperftools/profiler.h>
+namespace prof::inline v1_0_0 {
+/**
+ * $CXX -g -O3 perf.cpp -lprofiler
+ * CPUPROFILE_FREQUENCY=1000 ./a.out
+ * google-pprof a.out profile.prof
+ */
+class gperf {
+ public:
+  constexpr explicit gperf(const char* fname)
+    : fname_{fname}
+  { }
+
+  constexpr gperf(gperf&&) = default;
+  constexpr gperf(const gperf&) = delete;
+
+  /*constexpr*/ auto start() {
+    return ProfilerStart(fname_);
+  }
+
+  /*constexpr*/ auto stop() {
+    return ProfilerStop();
+  }
+
+  /*constexpr*/ auto flush() {
+    return ProfilerFlush();
+  }
+
+  /*constexpr*/ ~gperf() noexcept {
+    flush();
+  }
+
+ private:
+  const char* fname_{};
+};
+} // namespace prof
+#endif
+
+#if __has_include(<ittnotify.h>)
+#include <ittnotify.h>
+namespace prof::inline v1_0_0 {
+/**
+ * `-littnotify`
+ * `vtune -collect performance-snapshot -start-paused -finalization-mode=full -r result -- ./a.out`
+ * https://www.intel.com/content/www/us/en/developer/tools/oneapi/vtune-profiler.html
+ * https://github.com/intel/ittapi
+ */
+class intel_vtune {
+ public:
+  constexpr explicit intel_vtune(const char* domain, const char* task)
+    : domain_{__itt_domain_create(domain)}, task_name_{__itt_string_handle_create(task)} {
+    __itt_task_begin(domain_, __itt_null, __itt_null, task_name_);
+  }
+
+  constexpr intel_vtune(intel_vtune&&) = default;
+  constexpr intel_vtune(const intel_vtune&) = delete;
+
+  /*constexpr*/ auto start() {
+    return __itt_resume();
+  }
+
+  /*constexpr*/ auto stop() {
+    return __itt_pause();
+  }
+
+  /*constexpr*/ ~intel_vtune() noexcept {
+    __itt_task_end(domain_);
+  }
+
+ private:
+  __itt_domain* domain_{};
+  __itt_string_handle* task_name_{};
+};
+} // namespace prof
+#endif
+
+#ifndef NTEST
+static_assert(([] {
+  static_assert(not prof::profiler<void>);
+  static_assert(prof::profiler<prof::none>);
+
+  #if __has_include(<valgrind/callgrind.h>)
+  static_assert(prof::profiler<prof::callgrind>);
+  #endif
+
+  #if __has_include(<xray/xray_interface.h>) and \
+      __has_include(<xray/xray_log_interface.h>)
+  static_assert(prof::profiler<prof::xray>);
+  #endif
+
+  #if __has_include(<fcntl.h>) and __has_include(<unistd.h>) and __has_include(<cassert>)
+  static_assert(prof::profiler<prof::linux_perf>);
+  #endif
+
+  #if __has_include(<gperftools/profiler.h>)
+  static_assert(prof::profiler<prof::gperf>);
+  #endif
+
+  #if __has_include(<ittnotify.h>)
+  static_assert(prof::profiler<prof::intel_vtune>);
+  #endif
+}(), true));
+#endif // NTEST
